@@ -1,0 +1,23 @@
+# Keeps dependency drift visible for this action.
+#
+# requirements.txt pins pymupdf exactly on purpose: detection behaviour
+# must be reproducible across CI runs (see README > Development). An
+# exact pin also means the pin ages silently — Dependabot exists here to
+# surface that. Treat its pymupdf PRs as advisory prompts, not
+# merge-ready bumps: review the upstream changelog/CVE advisories, then
+# re-run the full test suite (unit + dogfood fixtures) before accepting
+# a bump. OSV check 2026-10-29: no known advisories for pymupdf 2.0.
+version: 2
+updates:
+  # Python detection dependency (pymupdf) from requirements.txt.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Actions this repo runs in its own CI (ci.yml) and ships in the
+  # composite action (action.yml): actions/checkout, actions/setup-python.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
