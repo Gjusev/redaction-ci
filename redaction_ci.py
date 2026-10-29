@@ -1,18 +1,40 @@
 #!/usr/bin/env python3
 """Redaction-CI: detect fake PDF redactions.
 
-Two failure modes are detected per page:
+Failure modes detected per page:
 
 1. ``covered-text``  -- extractable text that sits under a later-drawn,
    opaque, dark filled box without being removed (classic "x-ray"
    redaction: the text is still in the content stream, one copy-paste
    away). Reported with severity ``confirmed``.
-2. ``invisible-text`` -- text that is never rendered: PDF render mode 3
-   (hidden OCR layers, hidden copies of sensitive strings) or text with
-   near-zero fill opacity. Reported with severity ``warning``.
+2. ``unapplied-redaction`` -- a PDF redaction annotation whose underlying
+   text is still extractable: someone marked the redaction but never
+   applied it. Severity ``confirmed``.
+3. ``invisible-text`` -- text that is never rendered: PDF render mode 3
+   (hidden copies of sensitive strings) or text with near-zero fill
+   opacity. Invisible spans that overlap a placed image are treated as a
+   legitimate OCR layer of a scan and skipped. Severity ``warning``.
+4. ``camouflaged-text`` -- text whose fill colour matches the box (or the
+   white page) behind it: black-on-black / white-on-white, invisible to
+   every viewer, extractable by every tool. Severity ``warning``.
+5. ``off-page-text`` -- text placed entirely outside the visible page
+   rectangle: never rendered, recoverable by unclipped extractors.
+   Severity ``warning``.
+6. ``image-covered-text`` -- extractable text geometrically under a
+   placed image (paint order is not verified, so this is a warning, not a
+   confirmed leak). Severity ``warning``.
+7. ``form-value`` -- AcroForm fields that still carry values.
+   Severity ``warning``.
+8. ``attachment`` -- embedded file attachments shipping whole extra
+   documents inside the PDF. Severity ``warning``.
+9. ``incremental-leftover`` -- earlier document revisions recoverable
+   before the first ``%%EOF`` of an incrementally saved file; the first
+   revision is re-scanned and only reported when it actually contains
+   findings. Severity ``confirmed`` when the earlier revision has a
+   confirmed finding, else ``warning``.
 
 Pages that contain no text at all (scans, image-only PDFs) are listed as
-informational: verifying them needs OCR, which is out of scope for v0.1.
+informational: verifying them needs OCR, which is out of scope.
 
 Exit codes:
     0  no findings matched the --fail-on policy
@@ -30,16 +52,35 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import pymupdf
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DEFAULT_PATHS = "**/*.pdf"
 
 KIND_COVERED = "covered-text"
+KIND_UNAPPLIED = "unapplied-redaction"
 KIND_INVISIBLE = "invisible-text"
+KIND_CAMOUFLAGE = "camouflaged-text"
+KIND_OFFPAGE = "off-page-text"
+KIND_IMAGE_COVER = "image-covered-text"
+KIND_FORM_VALUE = "form-value"
+KIND_ATTACHMENT = "attachment"
+KIND_INCREMENTAL = "incremental-leftover"
+
+KIND_TITLES = {
+    KIND_COVERED: "Fake redaction: text recoverable under box",
+    KIND_UNAPPLIED: "Redaction annotation never applied",
+    KIND_INVISIBLE: "Invisible text layer (render mode 3 / zero opacity)",
+    KIND_CAMOUFLAGE: "Camouflaged text (same colour as its background)",
+    KIND_OFFPAGE: "Off-page text (present but never rendered)",
+    KIND_IMAGE_COVER: "Text under a covering image",
+    KIND_FORM_VALUE: "Form field carries a value",
+    KIND_ATTACHMENT: "Embedded attachment",
+    KIND_INCREMENTAL: "Earlier document revision recoverable",
+}
 
 SEVERITY_CONFIRMED = "confirmed"
 SEVERITY_WARNING = "warning"
@@ -53,9 +94,22 @@ MIN_BOX_SIDE = 2.0
 #: Annotation spam guard: GitHub caps annotations per step/job, so the
 #: workflow-command stream is truncated while all findings still count.
 MAX_ANNOTATIONS_PER_LEVEL = 50
+MAX_ERROR_ANNOTATIONS = 10
 MAX_SUMMARY_ROWS = 100
 
 EXCERPT_LIMIT = 60
+
+#: Text and box fill colours within this luminance distance are
+#: "camouflaged": no viewer can separate them.
+CAMOUFLAGE_DELTA = 0.12
+
+#: Text at least this bright, with nothing drawn under it, matches the
+#: default white PDF page: white-on-white.
+PALE_LUMA = 0.9
+
+#: Fraction of an invisible span that must overlap a placed image for the
+#: span to count as the OCR layer of a scan.
+OCR_OVERLAP = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +154,26 @@ def fill_luminance(color: Sequence[float]) -> float:
     return 0.299 * comps[0] + 0.587 * comps[1] + 0.114 * comps[2]
 
 
+def text_color_luminance(color: object) -> float:
+    """Luminance (0..1) of a text fill colour from ``get_texttrace()``.
+
+    pymupdf >= 1.26 reports ``color`` as an (r, g, b) float tuple; older
+    releases used a single sRGB int. Both are handled defensively.
+    """
+    if color is None:
+        return 1.0
+    if isinstance(color, (int, float)):
+        i = int(color)
+        comps = (((i >> 16) & 255) / 255, ((i >> 8) & 255) / 255, (i & 255) / 255)
+    else:
+        try:
+            comps = (float(v) for v in tuple(color)[:3])
+        except TypeError:
+            return 1.0
+        comps = tuple(comps)
+    return 0.299 * comps[0] + 0.587 * comps[1] + 0.114 * comps[2]
+
+
 def is_redaction_like(
     drawing: dict,
     max_fill_luma: float,
@@ -133,6 +207,19 @@ def excerpt(text: str, limit: int = EXCERPT_LIMIT) -> str:
     return text
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _sample(texts: Sequence[str], limit: int = 3) -> str:
+    seen: list[str] = []
+    for t in texts:
+        s = excerpt(t)
+        if s not in seen:
+            seen.append(s)
+    return " | ".join(seen[:limit])
+
+
 # ---------------------------------------------------------------------------
 # Findings
 # ---------------------------------------------------------------------------
@@ -144,38 +231,41 @@ class TextSpan:
     render_mode: int
     opacity: float
     seqno: int
+    luma: float
+
+    @property
+    def is_visible(self) -> bool:
+        return self.render_mode != RENDER_INVISIBLE and self.opacity > 0.05
 
 
 @dataclass(frozen=True)
 class FillBox:
     rect: tuple
     seqno: int
+    luma: float
 
 
 @dataclass
 class Finding:
-    kind: str  # KIND_COVERED | KIND_INVISIBLE
+    kind: str
     severity: str  # SEVERITY_CONFIRMED | SEVERITY_WARNING
     file: str
-    page: int  # 1-based
+    page: int  # 1-based; 0 = document-level (no page)
     rect: tuple
     text: str  # recoverable excerpt
     detail: str
 
     @property
     def title(self) -> str:
-        if self.kind == KIND_COVERED:
-            return "Fake redaction: text recoverable under box"
-        return "Invisible text layer (render mode 3 / zero opacity)"
+        return KIND_TITLES.get(self.kind, self.kind)
 
     def annotation(self) -> str:
         """GitHub workflow command for a file-level annotation."""
         level = "error" if self.severity == SEVERITY_CONFIRMED else "warning"
         title = escape_workflow_property(self.title)
         path = escape_workflow_property(self.file)
-        message = escape_workflow_data(
-            f"p{self.page} {self.detail}: {self.text!r}"
-        )
+        prefix = f"p{self.page} " if self.page else ""
+        message = escape_workflow_data(f"{prefix}{self.detail}: {self.text!r}")
         return f"::{level} file={path},title={title}::{message}"
 
 
@@ -222,6 +312,7 @@ def _collect_spans(page: "pymupdf.Page") -> list[TextSpan]:
                 render_mode=int(s.get("type", 0)),
                 opacity=float(s.get("opacity", 1.0)),
                 seqno=int(s.get("seqno", -1)),
+                luma=text_color_luminance(s.get("color")),
             )
         )
     return spans
@@ -241,8 +332,59 @@ def _fill_boxes(
         # last (worst case) so we stay on the recall side.
         seqno = int(seqno) if seqno is not None else sys.maxsize
         r = d["rect"]
-        boxes.append(FillBox(rect=(r.x0, r.y0, r.x1, r.y1), seqno=seqno))
-    return boxes
+        boxes.append(
+            FillBox(
+                rect=(r.x0, r.y0, r.x1, r.y1),
+                seqno=seqno,
+                luma=fill_luminance(d["fill"]),
+            )
+        )
+    # Stacked identical boxes (e.g. a double-painted rect) are one box.
+    dedup: dict[tuple, FillBox] = {}
+    for b in boxes:
+        key = tuple(round(v, 1) for v in b.rect)
+        prev = dedup.get(key)
+        if prev is None or b.seqno > prev.seqno:
+            dedup[key] = b
+    return list(dedup.values())
+
+
+def _page_images(page: "pymupdf.Page") -> list[tuple]:
+    """Bounding boxes of opaque placed images large enough to hide text.
+
+    Masked/soft-masked images can be transparent, so they are skipped:
+    they cannot be assumed to hide anything.
+    """
+    rects = []
+    for info in page.get_image_info() or ():
+        if info.get("has-mask"):
+            continue
+        r = info.get("bbox")
+        if not r or (r[2] - r[0]) < MIN_BOX_SIDE or (r[3] - r[1]) < MIN_BOX_SIDE:
+            continue
+        rects.append(tuple(r))
+    return rects
+
+
+def _has_visible_copy(span: TextSpan, box: FillBox, visible_index: dict) -> bool:
+    """True if the same text is also visibly painted ON TOP of the box.
+
+    Some generators emit text, then a dark backing panel, then the same
+    text again in white on top. Nothing is concealed: the covered run has
+    a readable copy drawn after the box. A same-text span *under* the box
+    (double-drawn text, faux bold, a decoy) is itself covered and must not
+    suppress the finding.
+    """
+    for bbox, seqno in visible_index.get(_norm(span.text), ()):
+        if seqno > box.seqno and seqno != span.seqno and overlap_fraction(bbox, box.rect) > 0:
+            return True
+    return False
+
+
+def _overlaps_any(bbox: Sequence[float], rects: Sequence[tuple], threshold: float) -> bool:
+    # Strict '>' on purpose: the pale-text exclusions pass threshold 0.0,
+    # and a zero-overlap rect must NOT count as "something behind it".
+    return any(overlap_fraction(bbox, r) > threshold for r in rects)
 
 
 def scan_page(doc: "pymupdf.Document", page_number: int, file_label: str, opts: "Options") -> tuple[list[Finding], bool]:
@@ -250,54 +392,186 @@ def scan_page(doc: "pymupdf.Document", page_number: int, file_label: str, opts: 
     page = doc[page_number]
     spans = _collect_spans(page)
     boxes = _fill_boxes(page, opts.max_fill_luma, opts.min_fill_opacity)
+    images = _page_images(page)
     findings: list[Finding] = []
+    visible = [s for s in spans if s.is_visible]
+    visible_index: dict[str, list] = {}
+    for s in visible:
+        visible_index.setdefault(_norm(s.text), []).append((s.bbox, s.seqno))
+    page_rect = (page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1)
 
+    # 1. Extractable text under a later-drawn covering box (confirmed).
     for box in boxes:
         covered = [
             s
-            for s in spans
-            if s.render_mode != RENDER_INVISIBLE
-            and s.opacity > 0.05
-            and box.seqno > s.seqno
+            for s in visible
+            if box.seqno > s.seqno
             and overlap_fraction(s.bbox, box.rect) >= opts.min_overlap
+            and not _has_visible_copy(s, box, visible_index)
         ]
-        if not covered:
-            continue
-        seen: list[str] = []
-        for s in covered:
-            snippet = excerpt(s.text)
-            if snippet not in seen:
-                seen.append(snippet)
-        sample = " | ".join(seen[:3])
-        findings.append(
-            Finding(
-                kind=KIND_COVERED,
-                severity=SEVERITY_CONFIRMED,
-                file=file_label,
-                page=page_number + 1,
-                rect=box.rect,
-                text=sample,
-                detail=f"{len(covered)} extractable text run(s) still recoverable under covering box",
+        if covered:
+            findings.append(
+                Finding(
+                    kind=KIND_COVERED,
+                    severity=SEVERITY_CONFIRMED,
+                    file=file_label,
+                    page=page_number + 1,
+                    rect=box.rect,
+                    text=_sample(s.text for s in covered),
+                    detail=f"{len(covered)} extractable text run(s) still recoverable under covering box",
+                )
             )
-        )
 
-    for s in spans:
-        hidden_mode = s.render_mode == RENDER_INVISIBLE
-        hidden_opacity = s.opacity <= 0.05
-        if not (hidden_mode or hidden_opacity):
-            continue
-        why = "PDF render mode 3 (invisible)" if hidden_mode else "fill opacity <= 0.05"
+    # 2. Redaction annotations that were never applied (confirmed).
+    for annot in page.annots(types=[pymupdf.PDF_ANNOT_REDACT]) or ():
+        covered_text = page.get_text("text", clip=annot.rect).strip()
+        if covered_text:
+            findings.append(
+                Finding(
+                    kind=KIND_UNAPPLIED,
+                    severity=SEVERITY_CONFIRMED,
+                    file=file_label,
+                    page=page_number + 1,
+                    rect=tuple(annot.rect),
+                    text=excerpt(covered_text),
+                    detail="redaction annotation present but underlying text still extractable (apply_redactions never run)",
+                )
+            )
+
+    # 3. Text that is never rendered (warning). Invisible spans that sit
+    # on a placed image are the OCR layer of a scan -- legitimate.
+    hidden = [s for s in spans if not s.is_visible]
+    hidden_suspect = [s for s in hidden if not _overlaps_any(s.bbox, images, OCR_OVERLAP)]
+    if hidden_suspect:
+        mode3 = sum(1 for s in hidden_suspect if s.render_mode == RENDER_INVISIBLE)
+        faint = len(hidden_suspect) - mode3
+        why = "render mode 3" if mode3 else ""
+        if faint:
+            why = f"{why + ' / ' if why else ''}fill opacity <= 0.05"
         findings.append(
             Finding(
                 kind=KIND_INVISIBLE,
                 severity=SEVERITY_WARNING,
                 file=file_label,
                 page=page_number + 1,
-                rect=s.bbox,
-                text=excerpt(s.text),
-                detail=f"text present but never rendered ({why})",
+                rect=tuple(
+                    (
+                        min(s.bbox[0] for s in hidden_suspect),
+                        min(s.bbox[1] for s in hidden_suspect),
+                        max(s.bbox[2] for s in hidden_suspect),
+                        max(s.bbox[3] for s in hidden_suspect),
+                    )
+                ),
+                text=_sample(s.text for s in hidden_suspect),
+                detail=f"{len(hidden_suspect)} text run(s) present but never rendered ({why})",
             )
         )
+
+    # 4a. Camouflaged text: same colour as a box behind/around it,
+    # regardless of paint order (warning).
+    for box in boxes:
+        camouflaged = [
+            s
+            for s in visible
+            if box.seqno <= s.seqno
+            and overlap_fraction(s.bbox, box.rect) >= opts.min_overlap
+            and abs(s.luma - box.luma) <= CAMOUFLAGE_DELTA
+        ]
+        if camouflaged:
+            findings.append(
+                Finding(
+                    kind=KIND_CAMOUFLAGE,
+                    severity=SEVERITY_WARNING,
+                    file=file_label,
+                    page=page_number + 1,
+                    rect=box.rect,
+                    text=_sample(s.text for s in camouflaged),
+                    detail=f"{len(camouflaged)} text run(s) painted the same colour as the box behind them (never visible)",
+                )
+            )
+
+    # 4b. Near-white text with nothing but the white page behind it.
+    pale = [
+        s
+        for s in visible
+        if s.luma >= PALE_LUMA
+        and not _overlaps_any(s.bbox, [b.rect for b in boxes], 0.0)
+        and not _overlaps_any(s.bbox, images, 0.0)
+    ]
+    if pale:
+        findings.append(
+            Finding(
+                kind=KIND_CAMOUFLAGE,
+                severity=SEVERITY_WARNING,
+                file=file_label,
+                page=page_number + 1,
+                rect=pale[0].bbox,
+                text=_sample(s.text for s in pale),
+                detail=f"{len(pale)} near-white text run(s) on the white page (never visible)",
+            )
+        )
+
+    # 5. Text entirely outside the visible page: never rendered. Invisible
+    # spans are already reported by check 3; this catches the visible-mode
+    # ones so a span is never double-reported.
+    off_page = [s for s in visible if overlap_fraction(s.bbox, page_rect) == 0.0]
+    if off_page:
+        findings.append(
+            Finding(
+                kind=KIND_OFFPAGE,
+                severity=SEVERITY_WARNING,
+                file=file_label,
+                page=page_number + 1,
+                rect=off_page[0].bbox,
+                text=_sample(s.text for s in off_page),
+                detail=f"{len(off_page)} text run(s) entirely outside the visible page (recoverable by unclipped extractors)",
+            )
+        )
+
+    # 6. Text under a placed image (paint order unverified: warning).
+    for image_rect in images:
+        under = [
+            s
+            for s in visible
+            if overlap_fraction(s.bbox, image_rect) >= opts.min_overlap
+        ]
+        if under:
+            findings.append(
+                Finding(
+                    kind=KIND_IMAGE_COVER,
+                    severity=SEVERITY_WARNING,
+                    file=file_label,
+                    page=page_number + 1,
+                    rect=image_rect,
+                    text=_sample(s.text for s in under),
+                    detail=f"{len(under)} text run(s) under a covering image (image paint order not verified)",
+                )
+            )
+
+    # 7. AcroForm fields that still carry values. Checkboxes and radios
+    # carry only their on/off state -- nothing worth a warning.
+    for widget in page.widgets() or ():
+        if widget.field_type in (
+            pymupdf.PDF_WIDGET_TYPE_SIGNATURE,
+            pymupdf.PDF_WIDGET_TYPE_CHECKBOX,
+            pymupdf.PDF_WIDGET_TYPE_RADIOBUTTON,
+        ):
+            continue
+        value = widget.field_value
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value)
+        if value is not None and str(value).strip():
+            findings.append(
+                Finding(
+                    kind=KIND_FORM_VALUE,
+                    severity=SEVERITY_WARNING,
+                    file=file_label,
+                    page=page_number + 1,
+                    rect=tuple(widget.rect),
+                    text=excerpt(str(value)),
+                    detail=f"form field {widget.field_name!r} still carries a value",
+                )
+            )
 
     image_only = not spans and bool(page.get_images(full=False))
     return findings, image_only
@@ -320,9 +594,84 @@ def scan_file(path: Path, file_label: str, opts: "Options") -> tuple[list[Findin
             findings.extend(page_findings)
             if page_image_only:
                 image_only.append((file_label, pno + 1))
-        return findings, image_only, doc.page_count
+        for name in doc.embfile_names():
+            data = bytes(doc.embfile_get(name))
+            findings.append(
+                Finding(
+                    kind=KIND_ATTACHMENT,
+                    severity=SEVERITY_WARNING,
+                    file=file_label,
+                    page=0,
+                    rect=(0, 0, 0, 0),
+                    text=excerpt(data.decode("utf-8", "replace")),
+                    detail=f"embedded file {name!r} ({len(data)} bytes) recoverable",
+                )
+            )
+        pages = doc.page_count
     finally:
         doc.close()
+    findings.extend(_incremental_leftovers(path, file_label, opts))
+    return findings, image_only, pages
+
+
+def _incremental_leftovers(path: Path, file_label: str, opts: "Options") -> list[Finding]:
+    """Re-scan every earlier revision of an incrementally saved PDF.
+
+    Saving incrementally after "redacting" keeps every earlier revision in
+    the file. The byte prefix ending at each ``%%EOF`` marker is one
+    recoverable revision; the final one is the current document, already
+    scanned. Only when a recoverable revision actually contains findings
+    is anything reported, so writers that benignly emit multiple ``%%EOF``
+    markers stay quiet.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return []
+    positions: list[int] = []
+    start = 0
+    while True:
+        i = data.find(b"%%EOF", start)
+        if i < 0:
+            break
+        positions.append(i + 5)
+        start = i + 5
+    rev_findings: list[Finding] = []
+    seen: set = set()
+    for pos in positions[:-1]:  # the last prefix IS the current document
+        try:
+            old = pymupdf.open(stream=data[:pos], filetype="pdf")
+        except Exception:
+            continue  # unparseable prefix (e.g. linearized first body)
+        try:
+            if old.needs_pass or old.page_count == 0:
+                continue
+            for pno in range(old.page_count):
+                page_findings, _ = scan_page(old, pno, file_label, opts)
+                for f in page_findings:
+                    key = (f.kind, f.page, f.text)
+                    if key not in seen:
+                        seen.add(key)
+                        rev_findings.append(f)
+        except Exception:
+            continue
+        finally:
+            old.close()
+    if not rev_findings:
+        return []
+    has_confirmed = any(f.severity == SEVERITY_CONFIRMED for f in rev_findings)
+    first = rev_findings[0]
+    return [
+        Finding(
+            kind=KIND_INCREMENTAL,
+            severity=SEVERITY_CONFIRMED if has_confirmed else SEVERITY_WARNING,
+            file=file_label,
+            page=first.page,
+            rect=(0, 0, 0, 0),
+            text=first.text,
+            detail=f"{len(rev_findings)} issue(s) recoverable from {len(positions) - 1} earlier revision(s) of the file",
+        )
+    ]
 
 
 def glob_to_regex(pattern: str) -> "re.Pattern[str]":
@@ -330,9 +679,12 @@ def glob_to_regex(pattern: str) -> "re.Pattern[str]":
 
     pathlib's ``**`` handling changed semantics across 3.12 -> 3.13
     (``dir/**`` matches files on 3.13 but not on 3.12); the action runs on
-    whatever Python setup-python provides, so exclusion behaviour must not
+    whatever Python setup-python provides, so matching behaviour must not
     depend on that. Supported: ``**`` (any depth, including none), ``*``
     (within one path segment), ``?`` (one non-separator char).
+
+    Matching is case-insensitive: scanners produce ``.PDF`` as often as
+    ``.pdf``, and a missed file is a missed leak.
     """
     i, n = 0, len(pattern)
     out: list[str] = []
@@ -354,16 +706,23 @@ def glob_to_regex(pattern: str) -> "re.Pattern[str]":
         else:
             out.append(re.escape(c))
             i += 1
-    return re.compile("".join(["^", *out, "$"]))
+    return re.compile("".join(["^", *out, "$"]), re.IGNORECASE)
 
 
 def resolve_files(
     base: Path,
     patterns: Sequence[str],
     excludes: Sequence[str],
-) -> tuple[list[Path], list[str]]:
-    """Resolve globs relative to *base*; returns (files, unmatched_patterns)."""
-    candidates = [p for p in base.rglob("*") if p.is_file()]
+) -> tuple[list[Path], list[str], int]:
+    """Resolve globs relative to *base*.
+
+    Returns (files, unmatched_patterns, excluded_count). ``.git`` is never
+    walked: nothing in it is a scannable document.
+    """
+    candidates: list[Path] = []
+    for root, dirs, file_names in os.walk(base):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        candidates.extend(Path(root, name) for name in file_names)
 
     def match(pattern: str) -> set[Path]:
         rx = glob_to_regex(pattern)
@@ -376,9 +735,12 @@ def resolve_files(
         if not matched:
             unmatched.append(pattern)
         files |= matched
+    excluded = 0
     for pattern in excludes:
-        files -= match(pattern)
-    return sorted(files), unmatched
+        matched = match(pattern)
+        excluded += len(files & matched)
+        files -= matched
+    return sorted(files), unmatched, excluded
 
 
 def scan(
@@ -389,11 +751,16 @@ def scan(
     strict_patterns: bool = True,
 ) -> ScanResult:
     result = ScanResult()
-    files, unmatched = resolve_files(base_dir, patterns, excludes)
+    files, unmatched, excluded = resolve_files(base_dir, patterns, excludes)
     if strict_patterns:
         # A typo'd explicit glob would otherwise fail silently open.
         for pattern in unmatched:
             result.errors.append(f"pattern matched no files: {pattern}")
+    if excluded and not files:
+        # Excludes that empty the whole corpus are a mistake, not a clean
+        # scan -- this holds for the default glob too (the action always
+        # passes it), so it lives outside the strict_patterns gate.
+        result.errors.append("excludes removed every file matched by the patterns")
     for path in files:
         label = path.relative_to(base_dir).as_posix() if path.is_relative_to(base_dir) else str(path)
         try:
@@ -443,8 +810,9 @@ def summary_markdown(result: ScanResult, fail_on: str) -> str:
         lines.append("| File | Page | Type | Severity | Recoverable text |")
         lines.append("| --- | --- | --- | --- | --- |")
         for f in result.findings[:MAX_SUMMARY_ROWS]:
+            page = f.page if f.page else "—"
             lines.append(
-                f"| `{_md_cell(f.file)}` | {f.page} | {_md_cell(f.kind)} | {_md_cell(f.severity)} | {_md_cell(f.text)} |"
+                f"| `{_md_cell(f.file)}` | {page} | {_md_cell(f.kind)} | {_md_cell(f.severity)} | {_md_cell(f.text)} |"
             )
         if len(result.findings) > MAX_SUMMARY_ROWS:
             lines.append(f"| … | | {len(result.findings) - MAX_SUMMARY_ROWS} more finding(s) not listed | | |")
@@ -453,11 +821,11 @@ def summary_markdown(result: ScanResult, fail_on: str) -> str:
         lines.append("")
         lines.append(
             f"**Image-only page(s)** (no extractable text): {shown}. "
-            "Scanned/image PDFs need OCR to verify — out of scope in v0.1, see README limitations."
+            "Scanned/image PDFs need OCR to verify — out of scope, see README limitations."
         )
     if not result.findings and not result.errors:
         lines.append("")
-        lines.append("No recoverable text under redaction boxes, no invisible text layers found.")
+        lines.append("No recoverable text under redaction boxes, no invisible or camouflaged text layers found.")
     lines.append("")
     lines.append(
         "_Detection is heuristic (content-stream order, fill colour/opacity, overlap). "
@@ -488,20 +856,31 @@ def write_github_outputs(result: ScanResult, fail_on: str) -> None:
         fh.write(f"matched={verdict}\n")
 
 
-def emit_annotations(result: ScanResult, annotations: str) -> None:
+def emit_annotations(result: ScanResult, annotations: str, to_stderr: bool = False) -> None:
+    """Print GitHub workflow-command annotations.
+
+    With ``to_stderr`` (used for ``--format json``) the commands leave the
+    stdout JSON stream unpolluted; GitHub does not parse workflow commands
+    from stderr, so no annotations are rendered in that mode -- the JSON
+    consumer is expected to surface findings itself.
+    """
     if annotations == "never":
         return
     if annotations == "auto" and os.environ.get("GITHUB_ACTIONS") != "true":
         return
+    stream = sys.stderr if to_stderr else sys.stdout
     counts = {"error": 0, "warning": 0}
     for f in result.findings:
         level = "error" if f.severity == SEVERITY_CONFIRMED else "warning"
         if counts[level] >= MAX_ANNOTATIONS_PER_LEVEL:
             continue
         counts[level] += 1
-        print(f.annotation())
-    for err in result.errors:
-        print(f"::error title=Redaction-CI scan error::{escape_workflow_data(err)}")
+        print(f.annotation(), file=stream)
+    for err in result.errors[:MAX_ERROR_ANNOTATIONS]:
+        print(f"::error title=Redaction-CI scan error::{escape_workflow_data(err)}", file=stream)
+    if len(result.errors) > MAX_ERROR_ANNOTATIONS:
+        more = len(result.errors) - MAX_ERROR_ANNOTATIONS
+        print(f"::error title=Redaction-CI scan error::... and {more} more scan error(s) — see job summary", file=stream)
 
 
 def result_json(result: ScanResult) -> str:
@@ -542,13 +921,16 @@ class Options:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="redaction_ci",
-        description="Detect fake PDF redactions: extractable text under covering boxes and invisible text layers.",
+        description="Detect fake PDF redactions: extractable text under covering boxes, unapplied redaction annotations, invisible/camouflaged text layers and more.",
     )
     parser.add_argument(
         "--paths",
         default=None,
         metavar="GLOB",
-        help=f"newline-separated glob(s) of PDFs to scan, relative to cwd (default: {DEFAULT_PATHS!r})",
+        help=(
+            f"newline-separated glob(s) of PDFs to scan, relative to cwd (default: {DEFAULT_PATHS!r}); "
+            "a line starting with '!' is treated as an exclusion"
+        ),
     )
     parser.add_argument(
         "--exclude",
@@ -559,8 +941,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fail-on",
         choices=("any", "confirmed"),
-        default="any",
-        help="'any' fails on all findings; 'confirmed' fails only on extractable text under a box (default: any)",
+        default="confirmed",
+        help=(
+            "'confirmed' fails only on extractable text under a box, unapplied redactions and recoverable "
+            "earlier revisions (default); 'any' also fails on invisible/camouflaged text and the other warnings"
+        ),
     )
     parser.add_argument(
         "--max-fill-luma",
@@ -585,11 +970,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--annotations",
         choices=("auto", "always", "never"),
         default="auto",
-        help="emit GitHub workflow-command annotations (default: auto = only when GITHUB_ACTIONS=true)",
+        help="emit GitHub workflow-command annotations (default: auto = only when GITHUB_ACTIONS=true; with --format json they go to stderr)",
     )
     parser.add_argument("--format", choices=("text", "json"), default="text", help="stdout format (default: text)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
+
+
+def _split_patterns(paths: str | None, exclude: str) -> tuple[list[str], list[str]]:
+    """Split --paths/--exclude into (patterns, excludes), honouring '!'."""
+    patterns: list[str] = []
+    excludes = [p.strip() for p in exclude.splitlines() if p.strip()]
+    for line in (paths if paths is not None else DEFAULT_PATHS).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("!"):
+            negated = line[1:].strip()
+            if negated:
+                excludes.append(negated)
+        else:
+            patterns.append(line)
+    return patterns, excludes
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -600,21 +1002,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_fill_opacity=args.min_fill_opacity,
     )
 
-    patterns = [p.strip() for p in (args.paths if args.paths is not None else DEFAULT_PATHS).splitlines() if p.strip()]
-    excludes = [p.strip() for p in args.exclude.splitlines() if p.strip()]
+    if args.paths is not None and not args.paths.strip():
+        print("error: --paths was given but is empty; refusing to scan nothing", file=sys.stderr)
+        return 2
+    patterns, excludes = _split_patterns(args.paths, args.exclude)
+    if args.paths is not None and not patterns:
+        print("error: --paths contains only negation lines; refusing to scan nothing", file=sys.stderr)
+        return 2
 
     base = Path.cwd()
     # The action always passes --paths (its input default), so strictness is
     # keyed off the pattern itself: only user-chosen globs fail closed when
     # they match nothing; the default glob is allowed to scan zero PDFs.
-    strict_patterns = (args.paths or "").strip() not in (None, "", DEFAULT_PATHS)
+    strict_patterns = args.paths is not None and args.paths.strip() != DEFAULT_PATHS
     result = scan(base, patterns, excludes, opts, strict_patterns=strict_patterns)
 
     if args.format == "json":
         print(result_json(result))
     else:
         for f in result.findings:
-            loc = f"{f.file} p{f.page}"
+            loc = f"{f.file} p{f.page}" if f.page else f"{f.file} doc"
             print(f"[{f.severity.upper():9}] {loc} — {f.detail}: {f.text!r}")
         for err in result.errors:
             print(f"[ERROR    ] {err}")
@@ -627,7 +1034,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"verdict: {verdict} (fail-on: {args.fail_on})"
         )
 
-    emit_annotations(result, args.annotations)
+    emit_annotations(result, args.annotations, to_stderr=args.format == "json")
     write_summary(args.summary_file or "", summary_markdown(result, args.fail_on))
     write_github_outputs(result, args.fail_on)
 
