@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -324,21 +325,59 @@ def scan_file(path: Path, file_label: str, opts: "Options") -> tuple[list[Findin
         doc.close()
 
 
+def glob_to_regex(pattern: str) -> "re.Pattern[str]":
+    """Translate a path glob to a regex, independent of the Python version.
+
+    pathlib's ``**`` handling changed semantics across 3.12 -> 3.13
+    (``dir/**`` matches files on 3.13 but not on 3.12); the action runs on
+    whatever Python setup-python provides, so exclusion behaviour must not
+    depend on that. Supported: ``**`` (any depth, including none), ``*``
+    (within one path segment), ``?`` (one non-separator char).
+    """
+    i, n = 0, len(pattern)
+    out: list[str] = []
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if pattern[i : i + 3] == "**/":
+                out.append("(?:[^/]+/)*")
+                i += 3
+            elif pattern[i : i + 2] == "**":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(["^", *out, "$"]))
+
+
 def resolve_files(
     base: Path,
     patterns: Sequence[str],
     excludes: Sequence[str],
 ) -> tuple[list[Path], list[str]]:
     """Resolve globs relative to *base*; returns (files, unmatched_patterns)."""
+    candidates = [p for p in base.rglob("*") if p.is_file()]
+
+    def match(pattern: str) -> set[Path]:
+        rx = glob_to_regex(pattern)
+        return {p for p in candidates if rx.match(p.relative_to(base).as_posix())}
+
     files: set[Path] = set()
     unmatched: list[str] = []
     for pattern in patterns:
-        matched = {p for p in base.glob(pattern) if p.is_file()}
+        matched = match(pattern)
         if not matched:
             unmatched.append(pattern)
         files |= matched
     for pattern in excludes:
-        files -= {p for p in base.glob(pattern) if p.is_file()}
+        files -= match(pattern)
     return sorted(files), unmatched
 
 

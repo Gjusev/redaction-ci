@@ -64,6 +64,24 @@ def test_fill_luminance():
     assert rci.fill_luminance((0.0, 0.0, 0.0, 0.0)) == pytest.approx(1.0)
 
 
+def test_glob_to_regex_is_version_independent():
+    # dir/** must match files at any depth below dir (this exact pattern
+    # regressed in CI: pathlib's ** semantics changed between 3.12 and 3.13)
+    rx = rci.glob_to_regex("skip/**")
+    assert rx.match("skip/ignored.pdf")
+    assert rx.match("skip/a/b.pdf")
+    assert not rx.match("keep.pdf")
+    rx = rci.glob_to_regex("**/*.pdf")
+    assert rx.match("x.pdf")
+    assert rx.match("a/b/c.PDF") is None
+    assert rx.match("a/b/c.pdf")
+    rx = rci.glob_to_regex("contracts/*.pdf")
+    assert rx.match("contracts/a.pdf")
+    assert not rx.match("contracts/sub/a.pdf")
+    rx = rci.glob_to_regex("a?c.pdf")
+    assert rx.match("abc.pdf") and not rx.match("ac.pdf") and not rx.match("a/c.pdf")
+
+
 def test_is_redaction_like():
     def drawing(type="f", fill=(0, 0, 0), opacity=1.0, rect=(0, 0, 100, 20)):
         return {"type": type, "fill": fill, "fill_opacity": opacity, "rect": pymupdf.Rect(*rect)}
