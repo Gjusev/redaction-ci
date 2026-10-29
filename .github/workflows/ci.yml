@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --requirement requirements.txt pytest
+      - run: python -m pytest tests/ -q
+
+  # Dogfood: this repo's own CI runs the action on its own fixtures.
+  # The pass fixtures must NOT fail; the fake-redaction fixtures MUST fail.
+  dogfood-benign:
+    name: Dogfood — clean fixtures pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        id: scan
+        with:
+          paths: |
+            fixtures/benign-redacted.pdf
+            fixtures/image-only.pdf
+          fail-on: any
+      - name: Assert clean verdict
+        run: |
+          test "${{ steps.scan.outputs.files }}" -eq 2
+          test "${{ steps.scan.outputs.findings }}" -eq 0
+          test "${{ steps.scan.outputs.matched }}" = "false"
+
+  dogfood-fake:
+    name: Dogfood — fake redactions fail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan fake-redaction fixture (must exit non-zero)
+        uses: ./
+        id: fake
+        continue-on-error: true
+        with:
+          paths: fixtures/fake-redaction.pdf
+          fail-on: confirmed
+      - name: Assert the fake redaction was caught
+        run: |
+          if [ "${{ steps.fake.outcome }}" != "failure" ]; then
+            echo "::error::detector did NOT fail on fake-redaction.pdf"; exit 1
+          fi
+          test "${{ steps.fake.outputs.confirmed }}" -ge 1
+          test "${{ steps.fake.outputs.matched }}" = "true"
+
+  dogfood-invisible:
+    name: Dogfood — invisible text policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A warning must pass under fail-on: confirmed …
+      - uses: ./
+        id: invis-confirmed
+        with:
+          paths: fixtures/invisible-text.pdf
+          fail-on: confirmed
+      - name: Assert warning passes with fail-on confirmed
+        run: |
+          test "${{ steps.invis-confirmed.outcome }}" = "success"
+          test "${{ steps.invis-confirmed.outputs.warnings }}" -ge 1
+          test "${{ steps.invis-confirmed.outputs.confirmed }}" -eq 0
+      # … but fails under fail-on: any.
+      - uses: ./
+        id: invis-any
+        continue-on-error: true
+        with:
+          paths: fixtures/invisible-text.pdf
+          fail-on: any
+      - name: Assert warning fails with fail-on any
+        run: |
+          if [ "${{ steps.invis-any.outcome }}" != "failure" ]; then
+            echo "::error::fail-on=any did NOT fail on invisible-text.pdf"; exit 1
+          fi
+          test "${{ steps.invis-any.outputs.matched }}" = "true"

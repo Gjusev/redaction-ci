@@ -1,0 +1,3 @@
+# Detection dependency, pinned exactly so CI behaviour is reproducible.
+# Bump deliberately and re-run the test suite (see README > Development).
+pymupdf==2.0
