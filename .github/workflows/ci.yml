@@ -4,44 +4,72 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   unit-tests:
-    name: Unit tests
-    runs-on: ubuntu-latest
+    name: Unit tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pymupdf==2.0 requires Python >= 3.11; the action itself runs 3.12.
+        include:
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - run: python -m pip install --requirement requirements.txt pytest
       - run: python -m pytest tests/ -q
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.17.3
+      - run: ruff check .
+
   # Dogfood: this repo's own CI runs the action on its own fixtures.
-  # The pass fixtures must NOT fail; the fake-redaction fixtures MUST fail.
+  # The clean fixtures must NOT fail; the fake-redaction fixtures MUST fail.
   dogfood-benign:
     name: Dogfood — clean fixtures pass
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: ./
         id: scan
         with:
           paths: |
             fixtures/benign-redacted.pdf
             fixtures/image-only.pdf
+            fixtures/ocr-legit.pdf
+            fixtures/white-redraw.pdf
           fail-on: any
       - name: Assert clean verdict
+        env:
+          FILES: ${{ steps.scan.outputs.files }}
+          FINDINGS: ${{ steps.scan.outputs.findings }}
+          MATCHED: ${{ steps.scan.outputs.matched }}
         run: |
-          test "${{ steps.scan.outputs.files }}" -eq 2
-          test "${{ steps.scan.outputs.findings }}" -eq 0
-          test "${{ steps.scan.outputs.matched }}" = "false"
+          test "$FILES" -eq 4
+          test "$FINDINGS" -eq 0
+          test "$MATCHED" = "false"
 
   dogfood-fake:
     name: Dogfood — fake redactions fail
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Scan fake-redaction fixture (must exit non-zero)
         uses: ./
         id: fake
@@ -50,29 +78,37 @@ jobs:
           paths: fixtures/fake-redaction.pdf
           fail-on: confirmed
       - name: Assert the fake redaction was caught
+        env:
+          OUTCOME: ${{ steps.fake.outcome }}
+          CONFIRMED: ${{ steps.fake.outputs.confirmed }}
+          MATCHED: ${{ steps.fake.outputs.matched }}
         run: |
-          if [ "${{ steps.fake.outcome }}" != "failure" ]; then
+          if [ "$OUTCOME" != "failure" ]; then
             echo "::error::detector did NOT fail on fake-redaction.pdf"; exit 1
           fi
-          test "${{ steps.fake.outputs.confirmed }}" -ge 1
-          test "${{ steps.fake.outputs.matched }}" = "true"
+          test "$CONFIRMED" -ge 1
+          test "$MATCHED" = "true"
 
   dogfood-invisible:
     name: Dogfood — invisible text policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      # A warning must pass under fail-on: confirmed …
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # A warning must pass under the default fail-on: confirmed …
       - uses: ./
         id: invis-confirmed
         with:
           paths: fixtures/invisible-text.pdf
           fail-on: confirmed
       - name: Assert warning passes with fail-on confirmed
+        env:
+          OUTCOME: ${{ steps.invis-confirmed.outcome }}
+          WARNINGS: ${{ steps.invis-confirmed.outputs.warnings }}
+          CONFIRMED: ${{ steps.invis-confirmed.outputs.confirmed }}
         run: |
-          test "${{ steps.invis-confirmed.outcome }}" = "success"
-          test "${{ steps.invis-confirmed.outputs.warnings }}" -ge 1
-          test "${{ steps.invis-confirmed.outputs.confirmed }}" -eq 0
+          test "$OUTCOME" = "success"
+          test "$WARNINGS" -ge 1
+          test "$CONFIRMED" -eq 0
       # … but fails under fail-on: any.
       - uses: ./
         id: invis-any
@@ -81,8 +117,64 @@ jobs:
           paths: fixtures/invisible-text.pdf
           fail-on: any
       - name: Assert warning fails with fail-on any
+        env:
+          OUTCOME: ${{ steps.invis-any.outcome }}
+          MATCHED: ${{ steps.invis-any.outputs.matched }}
         run: |
-          if [ "${{ steps.invis-any.outcome }}" != "failure" ]; then
+          if [ "$OUTCOME" != "failure" ]; then
             echo "::error::fail-on=any did NOT fail on invisible-text.pdf"; exit 1
           fi
-          test "${{ steps.invis-any.outputs.matched }}" = "true"
+          test "$MATCHED" = "true"
+
+  dogfood-misc:
+    name: Dogfood — exclude input, encrypted exit 2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # exclude plumbing: scanning all fixtures minus the dirty ones must pass.
+      # (The step summary itself cannot be asserted cross-step: every step
+      # gets a private GITHUB_STEP_SUMMARY file that the runner merges into
+      # the job summary only at the end of the job. The CLI's summary
+      # writing is covered by test_cli_summary_file.)
+      - uses: ./
+        id: excluded
+        with:
+          paths: fixtures/*.pdf
+          exclude: |
+            fixtures/fake-redaction.pdf
+            fixtures/unapplied-redact.pdf
+            fixtures/incremental-leftover.pdf
+            fixtures/black-on-black.pdf
+            fixtures/off-page.pdf
+            fixtures/image-over-text.pdf
+            fixtures/stacked-boxes.pdf
+            fixtures/invisible-text.pdf
+            fixtures/form-value.pdf
+            fixtures/attachment.pdf
+            fixtures/encrypted.pdf
+          fail-on: any
+      - name: Assert exclude left exactly the clean fixtures
+        env:
+          FILES: ${{ steps.excluded.outputs.files }}
+          FINDINGS: ${{ steps.excluded.outputs.findings }}
+          MATCHED: ${{ steps.excluded.outputs.matched }}
+        run: |
+          test "$FILES" -eq 4
+          test "$FINDINGS" -eq 0
+          test "$MATCHED" = "false"
+      # an encrypted PDF is unverifiable: the step must exit 2
+      - name: Scan encrypted fixture (must exit 2)
+        uses: ./
+        id: encrypted
+        continue-on-error: true
+        with:
+          paths: fixtures/encrypted.pdf
+      - name: Assert the encrypted PDF failed the scan
+        env:
+          OUTCOME: ${{ steps.encrypted.outcome }}
+          FILES: ${{ steps.encrypted.outputs.files }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::encrypted.pdf did not fail the scan"; exit 1
+          fi
+          test "$FILES" -eq 0

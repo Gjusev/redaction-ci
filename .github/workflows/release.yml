@@ -1,0 +1,27 @@
+name: Release
+
+# On a pushed v* tag: move the major-version moving tag (v0, v1, …) so
+# consumers pined to @v0 track patch releases, and open a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Move major-version tag and create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          major="${TAG%%.*}"
+          git tag -f "$major" "$TAG"
+          git push -f origin "$major"
+          gh release create "$TAG" --title "$TAG" --notes "See CHANGELOG.md for the changes in this release."

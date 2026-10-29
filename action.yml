@@ -1,9 +1,10 @@
 name: "Redaction-CI"
 description: >-
   Detects fake PDF redactions before they reach your repository: extractable
-  text under covering boxes ("x-ray" redactions) and invisible text layers
-  (render mode 3 / hidden OCR layers). Fails the step when findings match the
-  fail-on policy. No secrets required.
+  text under covering boxes ("x-ray" redactions), unapplied redaction
+  annotations, invisible or camouflaged text layers, filled form fields,
+  embedded attachments and recoverable earlier revisions. Fails the step when
+  findings match the fail-on policy. No secrets required.
 author: "Gjusev"
 
 branding:
@@ -14,7 +15,8 @@ inputs:
   paths:
     description: >-
       Newline-separated glob(s) of PDFs to scan, relative to the repository
-      root. Example: "contracts/**/*.pdf\n!**/drafts/**".
+      root. A line starting with "!" excludes that glob, e.g.
+      "contracts/**/*.pdf\n!**/drafts/**". Matching is case-insensitive.
     required: false
     default: "**/*.pdf"
   exclude:
@@ -23,10 +25,12 @@ inputs:
     default: ""
   fail-on:
     description: >-
-      "any" fails on every finding; "confirmed" fails only on extractable
-      text recoverable under a covering box (invisible text is a warning).
+      "confirmed" (default) fails on extractable text under a box, unapplied
+      redaction annotations and recoverable earlier revisions; "any" also
+      fails on invisible/camouflaged text, form values, attachments and the
+      other warnings.
     required: false
-    default: "any"
+    default: "confirmed"
   max-fill-luma:
     description: >-
       A filled path counts as a redaction box if its perceived luminance is
@@ -44,16 +48,20 @@ inputs:
     description: "Minimum fill opacity for a box to count as covering (0..1). Default 0.5."
     required: false
     default: "0.5"
+  format:
+    description: "stdout format of the scan step: text (human) or json (machine-readable)."
+    required: false
+    default: "text"
 
 outputs:
   findings:
     description: "Total number of findings."
     value: ${{ steps.scan.outputs.findings }}
   confirmed:
-    description: "Findings with severity 'confirmed' (extractable text under a box)."
+    description: "Findings with severity 'confirmed' (leaks fail the build by default)."
     value: ${{ steps.scan.outputs.confirmed }}
   warnings:
-    description: "Findings with severity 'warning' (invisible text layers)."
+    description: "Findings with severity 'warning' (visible in annotations/summary)."
     value: ${{ steps.scan.outputs.warnings }}
   files:
     description: "Number of PDFs scanned."
@@ -65,14 +73,16 @@ outputs:
     description: "Number of PDFs with at least one finding."
     value: ${{ steps.scan.outputs.files-with-findings }}
   matched:
-    description: '"true" if findings matched the fail-on policy (step exits 1).'
+    description: >-
+      "true" if findings matched the fail-on policy (the step then exits
+      non-zero: 1 on findings, 2 on scan errors).
     value: ${{ steps.scan.outputs.matched }}
 
 runs:
   using: composite
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: "3.12"
 
@@ -80,16 +90,28 @@ runs:
       shell: bash
       run: python -m pip install --no-cache-dir --requirement "${{ github.action_path }}/requirements.txt"
 
+    # Inputs reach the script via env, never via ${{ }} inside the run block:
+    # textual interpolation before the shell parses is a script-injection
+    # vector whenever an input is wired to untrusted context.
     - name: Scan PDFs
       id: scan
       shell: bash
+      env:
+        PATHS: ${{ inputs.paths }}
+        EXCLUDE: ${{ inputs.exclude }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        MAX_FILL_LUMA: ${{ inputs.max-fill-luma }}
+        MIN_OVERLAP: ${{ inputs.min-overlap }}
+        MIN_FILL_OPACITY: ${{ inputs.min-fill-opacity }}
+        FORMAT: ${{ inputs.format }}
       run: |
         python "${{ github.action_path }}/redaction_ci.py" \
-          --paths "${{ inputs.paths }}" \
-          --exclude "${{ inputs.exclude }}" \
-          --fail-on "${{ inputs.fail-on }}" \
-          --max-fill-luma "${{ inputs.max-fill-luma }}" \
-          --min-overlap "${{ inputs.min-overlap }}" \
-          --min-fill-opacity "${{ inputs.min-fill-opacity }}" \
+          --paths "$PATHS" \
+          --exclude "$EXCLUDE" \
+          --fail-on "$FAIL_ON" \
+          --max-fill-luma "$MAX_FILL_LUMA" \
+          --min-overlap "$MIN_OVERLAP" \
+          --min-fill-opacity "$MIN_FILL_OPACITY" \
+          --format "$FORMAT" \
           --annotations auto \
           --summary-file "${GITHUB_STEP_SUMMARY:-}"

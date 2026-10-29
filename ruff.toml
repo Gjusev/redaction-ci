@@ -1,0 +1,4 @@
+# Minimal, stable rule set: the CI lint job must not start failing just
+# because a new ruff release widened its default rules.
+[lint]
+select = ["E4", "E7", "E9", "F"]

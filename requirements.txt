@@ -1,3 +1,4 @@
 # Detection dependency, pinned exactly so CI behaviour is reproducible.
 # Bump deliberately and re-run the test suite (see README > Development).
+# NOTE: pymupdf 2.0 wheels are cp311-abi3 -- Python >= 3.11 required.
 pymupdf==2.0
