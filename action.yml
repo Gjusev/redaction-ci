@@ -1,0 +1,95 @@
+name: "Redaction-CI"
+description: >-
+  Detects fake PDF redactions before they reach your repository: extractable
+  text under covering boxes ("x-ray" redactions) and invisible text layers
+  (render mode 3 / hidden OCR layers). Fails the step when findings match the
+  fail-on policy. No secrets required.
+author: "Gjusev"
+
+branding:
+  icon: "eye-off"
+  color: "black"
+
+inputs:
+  paths:
+    description: >-
+      Newline-separated glob(s) of PDFs to scan, relative to the repository
+      root. Example: "contracts/**/*.pdf\n!**/drafts/**".
+    required: false
+    default: "**/*.pdf"
+  exclude:
+    description: "Newline-separated glob(s) to exclude from the scan."
+    required: false
+    default: ""
+  fail-on:
+    description: >-
+      "any" fails on every finding; "confirmed" fails only on extractable
+      text recoverable under a covering box (invisible text is a warning).
+    required: false
+    default: "any"
+  max-fill-luma:
+    description: >-
+      A filled path counts as a redaction box if its perceived luminance is
+      at most this value (0..1). Lower = only dark boxes; raise to also flag
+      white-outs. Default 0.85.
+    required: false
+    default: "0.85"
+  min-overlap:
+    description: >-
+      Minimum fraction of a text run's bounding box a box must cover to
+      count as hiding it (0..1). Default 0.5.
+    required: false
+    default: "0.5"
+  min-fill-opacity:
+    description: "Minimum fill opacity for a box to count as covering (0..1). Default 0.5."
+    required: false
+    default: "0.5"
+
+outputs:
+  findings:
+    description: "Total number of findings."
+    value: ${{ steps.scan.outputs.findings }}
+  confirmed:
+    description: "Findings with severity 'confirmed' (extractable text under a box)."
+    value: ${{ steps.scan.outputs.confirmed }}
+  warnings:
+    description: "Findings with severity 'warning' (invisible text layers)."
+    value: ${{ steps.scan.outputs.warnings }}
+  files:
+    description: "Number of PDFs scanned."
+    value: ${{ steps.scan.outputs.files }}
+  pages:
+    description: "Number of pages scanned."
+    value: ${{ steps.scan.outputs.pages }}
+  files-with-findings:
+    description: "Number of PDFs with at least one finding."
+    value: ${{ steps.scan.outputs.files-with-findings }}
+  matched:
+    description: '"true" if findings matched the fail-on policy (step exits 1).'
+    value: ${{ steps.scan.outputs.matched }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install detector dependency
+      shell: bash
+      run: python -m pip install --no-cache-dir --requirement "${{ github.action_path }}/requirements.txt"
+
+    - name: Scan PDFs
+      id: scan
+      shell: bash
+      run: |
+        python "${{ github.action_path }}/redaction_ci.py" \
+          --paths "${{ inputs.paths }}" \
+          --exclude "${{ inputs.exclude }}" \
+          --fail-on "${{ inputs.fail-on }}" \
+          --max-fill-luma "${{ inputs.max-fill-luma }}" \
+          --min-overlap "${{ inputs.min-overlap }}" \
+          --min-fill-opacity "${{ inputs.min-fill-opacity }}" \
+          --annotations auto \
+          --summary-file "${GITHUB_STEP_SUMMARY:-}"
