@@ -4,6 +4,16 @@ All notable changes to Redaction-CI are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-10-30
+
+### Changed
+
+- README restructured for the GitHub Marketplace listing: banner, badges,
+  demo output, recipes (PR comment, JSON output, strict mode), privacy
+  and security section, copy pass for tone and consistency.
+- `action.yml` description tightened for marketplace listings.
+- Repository topics set (`pdf`, `security`, `github-actions`, …).
+
 ## [0.2.0] — 2026-10-29
 
 ### Breaking
