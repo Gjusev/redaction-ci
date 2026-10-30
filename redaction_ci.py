@@ -56,7 +56,7 @@ from typing import Sequence
 
 import pymupdf
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEFAULT_PATHS = "**/*.pdf"
 

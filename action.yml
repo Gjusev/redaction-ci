@@ -1,10 +1,10 @@
 name: "Redaction-CI"
 description: >-
-  Detects fake PDF redactions before they reach your repository: extractable
-  text under covering boxes ("x-ray" redactions), unapplied redaction
-  annotations, invisible or camouflaged text layers, filled form fields,
-  embedded attachments and recoverable earlier revisions. Fails the step when
-  findings match the fail-on policy. No secrets required.
+  Fails CI when a committed PDF still contains recoverable text under its
+  redaction boxes: x-ray redactions, unapplied redaction annotations,
+  invisible or camouflaged text, off-page text, screenshots over live text,
+  filled form fields, attachments and earlier revisions left by incremental
+  saves. No secrets, no token; the detector itself makes no network calls.
 author: "Gjusev"
 
 branding:
